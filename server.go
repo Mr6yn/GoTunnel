@@ -1,50 +1,52 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Server runs on the Iran server.
-// It listens for:
-//   1. Control connections from the foreign client
-//   2. User connections on exposed ports
-// Then bridges them together.
 
 type Server struct {
-	cfg        *Config
-	clientPool chan net.Conn // pre-connected tunnels from foreign client
-	mu         sync.Mutex
+	cfg          *Config
+	clientPool   chan net.Conn
+	mu           sync.Mutex
+	poolReady    int64 // atomic count of ready tunnels
+	totalServed  int64 // atomic count of served connections
+	lastClientIP string
+	lastSeen     time.Time
+	connected    bool
+	startTime    time.Time
 }
+
+var globalServer *Server
 
 func RunServer(cfg *Config) {
 	s := &Server{
-		cfg:        cfg,
+		cfg:       cfg,
 		clientPool: make(chan net.Conn, cfg.PoolSize*2),
+		startTime: time.Now(),
 	}
+	globalServer = s
 	s.start()
 }
 
 func (s *Server) start() {
-	// Start control listener (foreign client connects here)
 	go s.listenControl()
-
-	// Start user-facing port listeners
 	for _, port := range s.cfg.ServerPorts {
 		go s.listenUserPort(port)
 	}
-
-	// Start health reporter
+	go s.statusAPI()
 	go s.healthReporter()
-
-	// Block forever
 	select {}
 }
 
-// listenControl waits for the foreign client to connect and register tunnels
 func (s *Server) listenControl() {
 	ln, err := net.Listen("tcp", s.cfg.ServerBindAddr)
 	if err != nil {
@@ -56,7 +58,6 @@ func (s *Server) listenControl() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Printf("[SERVER] Accept error: %v\n", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -64,9 +65,6 @@ func (s *Server) listenControl() {
 	}
 }
 
-// handleIncoming reads the first byte to determine connection type:
-// 'T' = tunnel connection (pre-pooled, waiting for user)
-// 'H' = heartbeat ping
 func (s *Server) handleIncoming(conn net.Conn) {
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
@@ -86,26 +84,43 @@ func (s *Server) handleIncoming(conn net.Conn) {
 		return
 	}
 
-	conn.SetDeadline(time.Time{}) // clear deadline
+	conn.SetDeadline(time.Time{})
 
 	switch msgType {
-	case 'T': // Tunnel - add to pool
+	case 'T': // Tunnel pre-connect
 		select {
 		case s.clientPool <- conn:
-			// ok
+			atomic.AddInt64(&s.poolReady, 1)
+			s.mu.Lock()
+			s.lastClientIP = conn.RemoteAddr().String()
+			s.lastSeen = time.Now()
+			s.connected = true
+			s.mu.Unlock()
 		default:
-			// Pool full, close this one
 			conn.Close()
 		}
 	case 'H': // Heartbeat
+		s.mu.Lock()
+		s.lastClientIP = conn.RemoteAddr().String()
+		s.lastSeen = time.Now()
+		s.connected = true
+		s.mu.Unlock()
 		conn.Write([]byte("OK"))
+		conn.Close()
+	case 'S': // Status ping from client
+		s.mu.Lock()
+		pool := len(s.clientPool)
+		served := atomic.LoadInt64(&s.totalServed)
+		uptime := time.Since(s.startTime).Round(time.Second).String()
+		s.mu.Unlock()
+		resp := fmt.Sprintf(`{"pool":%d,"served":%d,"uptime":"%s"}`, pool, served, uptime)
+		conn.Write([]byte(resp))
 		conn.Close()
 	default:
 		conn.Close()
 	}
 }
 
-// listenUserPort listens for end-user connections on a given port
 func (s *Server) listenUserPort(port int) {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
@@ -125,48 +140,81 @@ func (s *Server) listenUserPort(port int) {
 	}
 }
 
-// bridgeUser grabs a pre-connected tunnel and bridges user ↔ foreign server
 func (s *Server) bridgeUser(userConn net.Conn) {
 	defer userConn.Close()
 
-	// Wait up to 5s for an available tunnel
 	var tunnelConn net.Conn
 	select {
 	case tunnelConn = <-s.clientPool:
+		atomic.AddInt64(&s.poolReady, -1)
 	case <-time.After(5 * time.Second):
 		fmt.Println("[SERVER] No tunnel available, dropping user connection")
 		return
 	}
 
-	// Signal client that this tunnel is now active
+	atomic.AddInt64(&s.totalServed, 1)
 	tunnelConn.Write([]byte("GO"))
-
-	// Bridge the two connections
 	bridge(userConn, tunnelConn)
+}
+
+// statusAPI exposes HTTP status endpoint on StatusPort
+func (s *Server) statusAPI() {
+	if s.cfg.StatusPort == 0 {
+		return
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", s.cfg.StatusPort)
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		connected := s.connected
+		lastSeen := s.lastSeen
+		clientIP := s.lastClientIP
+		s.mu.Unlock()
+
+		// mark disconnected if no heartbeat for 3x heartbeat interval
+		if time.Since(lastSeen) > time.Duration(s.cfg.HeartbeatSec*3)*time.Second {
+			connected = false
+		}
+
+		data := map[string]interface{}{
+			"mode":        "server",
+			"connected":   connected,
+			"pool_ready":  atomic.LoadInt64(&s.poolReady),
+			"total_served": atomic.LoadInt64(&s.totalServed),
+			"client_ip":   clientIP,
+			"last_seen":   lastSeen.Format("15:04:05"),
+			"uptime":      time.Since(s.startTime).Round(time.Second).String(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
+	})
+	http.ListenAndServe(addr, nil)
 }
 
 func (s *Server) healthReporter() {
 	for {
 		time.Sleep(30 * time.Second)
-		fmt.Printf("[SERVER] Pool size: %d tunnels ready\n", len(s.clientPool))
+		s.mu.Lock()
+		connected := s.connected
+		lastSeen := s.lastSeen
+		s.mu.Unlock()
+		if time.Since(lastSeen) > time.Duration(s.cfg.HeartbeatSec*3)*time.Second {
+			connected = false
+		}
+		status := "✓ وصل"
+		if !connected {
+			status = "✗ قطع"
+		}
+		fmt.Printf("[SERVER] وضعیت: %s | Pool: %d | کل اتصال: %d\n",
+			status, len(s.clientPool), atomic.LoadInt64(&s.totalServed))
 	}
 }
 
-// bridge copies data between two connections bidirectionally
 func bridge(a, b net.Conn) {
 	defer a.Close()
 	defer b.Close()
 
 	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(a, b)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(b, a)
-		done <- struct{}{}
-	}()
-
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
 	<-done
 }
