@@ -54,7 +54,7 @@ xray / v2ray / پنل
 فقط یک دستور روی هر سرور اجرا کن — اسکریپت همه چیز رو میپرسه:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gotunnel.git
+git clone https://github.com/Mr6yn/GoTunnel.git
 cd gotunnel
 chmod +x install.sh
 sudo bash install.sh
